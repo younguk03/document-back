@@ -39,7 +39,7 @@ fastapi==0.121.2
 ffmpy==1.0.0
 filelock==3.20.0
 fire==0.7.1
-fitz==0.0.1.dev2
+PyMuPDF
 Flask==3.1.2
 flask-cors==6.0.1
 flatbuffers==25.9.23
@@ -208,5 +208,6 @@ xlsxwriter==3.2.9
 xsdata==25.7
 yarl==1.22.0
 gunicorn
+
 
 
