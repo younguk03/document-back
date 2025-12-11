@@ -207,5 +207,6 @@ xinference-client==1.13.0
 xlsxwriter==3.2.9
 xsdata==25.7
 yarl==1.22.0
+gunicorn
 
 
