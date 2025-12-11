@@ -8,6 +8,7 @@ import uuid
 import subprocess
 import fitz  # PyMuPDF (코드 최상단에 추가 권장)
 from werkzeug.utils import secure_filename
+import gc
 
 from summarize import summarization, understand
 import google.generativeai as genai
@@ -36,6 +37,9 @@ except Exception as e:
     print(f"Supabase 클라이언트 초기화 오류: {e}")
     supabase = None
 
+# 로깅 설정
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 @app.route('/')
@@ -154,7 +158,10 @@ def clean_text_for_db(text):
 
 @app.route('/api/upload', methods=['POST'])
 def upload_translate():
-    print("\n========== [프로세스 시작] ==========")
+    logger.info("========== [프로세스 시작] ==========")
+    
+    # 0. 메모리 정리 (시작 전 청소)
+    gc.collect()
 
     # 1. 파일 유효성 검사
     if 'file' not in request.files:
@@ -166,18 +173,18 @@ def upload_translate():
     if not user_id or user_id == 'undefined':
         return jsonify({"error": "로그인 정보(User ID)가 유실되었습니다."}), 400
 
-    # 파일명 안전하게 변환
+    # 2. 파일명 및 경로 설정
     original_title = secure_filename(file.filename)
     unique_id = uuid.uuid4().hex
-
+    
     input_filename = f"original_{unique_id}.pdf"
     final_output_filename = f"translated_{unique_id}.pdf"
-
+    
     input_path = os.path.join(TEMP_DIR, input_filename)
     final_output_path = os.path.join(TEMP_DIR, final_output_filename)
     prompt_path = os.path.join(TEMP_DIR, f"prompt_{unique_id}.txt")
 
-    # 나중에 지울 파일들
+    # 정리 대상 파일 리스트
     files_to_clean = [input_path, prompt_path]
 
     try:
@@ -185,145 +192,143 @@ def upload_translate():
         # A. 원본 파일 로컬 저장
         # ---------------------------------------------------------
         file.save(input_path)
-        print(f"📂 원본 저장 완료: {input_path}")
+        logger.info(f"📂 원본 저장 완료: {input_path}")
 
         # ---------------------------------------------------------
-        # B. 프롬프트 생성 (번역 옵션)
+        # B. [최적화] 텍스트 추출 (원본 파일 사용 & 제한 읽기)
+        # 번역본을 기다리지 않고 원본에서 바로 추출하여 메모리와 시간을 아낍니다.
         # ---------------------------------------------------------
-        custom_prompt_text = "전문 용어 제외하고 한국어로 번역. 코드나 논문 제목은 원문 유지."
-        with open(prompt_path, "w", encoding="utf-8") as f:
-            f.write(custom_prompt_text)
-
-        # ---------------------------------------------------------
-        # C. 번역 실행 (pdf2zh) - 실패해도 죽지 않게 처리
-        # ---------------------------------------------------------
-        translate_success = False
-
-        # API 키 확인
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            print("❌ 경고: GEMINI_API_KEY가 없습니다. 번역을 건너뜁니다.")
-        else:
-            try:
-                print("🤖 번역 시작 (시간이 걸릴 수 있습니다)...")
-                env = os.environ.copy()
-                env['GEMINI_API_KEY'] = api_key
-
-                command = [
-                    "pdf2zh", input_path,
-                    "-li", "en", "-lo", "ko",
-                    "-s", "google:gemini",
-                    "-o", TEMP_DIR,
-                    "--prompt", prompt_path, "-t", "1"
-                ]
-                # 타임아웃 60초 설정 (무한 로딩 방지)
-                subprocess.run(command, check=True, env=env, capture_output=True, timeout=60)
-
-                # 결과 파일 찾기 (유연하게 검색)
-                # pdf2zh는 보통 {파일명}-mono.pdf 로 저장함
-                files_in_dir = os.listdir(TEMP_DIR)
-                target_prefix = input_filename.replace('.pdf', '')
-                found_mono = None
-
-                for fname in files_in_dir:
-                    if fname.endswith("-mono.pdf") and (target_prefix in fname):
-                        found_mono = fname
-                        break
-
-                if found_mono:
-                    os.rename(os.path.join(TEMP_DIR, found_mono), final_output_path)
-                    files_to_clean.append(final_output_path)
-                    translate_success = True
-                    print("✅ 번역 성공")
-                else:
-                    print(f"⚠️ 번역 파일 생성 안됨. 폴더 목록: {files_in_dir}")
-
-            except Exception as e:
-                print(f"⚠️ 번역 프로세스 중 에러 (무시하고 원본만 업로드): {e}")
-
-        # ---------------------------------------------------------
-        # D. 텍스트 추출 및 요약
-        # ---------------------------------------------------------
-        # 번역본이 있으면 번역본 사용, 없으면 원본 사용
-        target_file_for_text = final_output_path if translate_success else input_path
-
         text_content = ""
         try:
-            doc = fitz.open(target_file_for_text)
-            for page in doc:
-                text_content += page.get_text()
+            with fitz.open(input_path) as doc:
+                # 최대 5페이지만 읽거나 3000자 넘으면 중단 (메모리 절약)
+                for i, page in enumerate(doc):
+                    if i >= 5: break 
+                    text_content += page.get_text()
+                    if len(text_content) > 4000: break
+            
+            logger.info(f"📝 텍스트 추출 완료 ({len(text_content)}자)")
         except Exception as e:
-            text_content = "텍스트 추출 실패"
+            logger.error(f"⚠️ 텍스트 추출 실패: {e}")
+            text_content = ""
 
-        # 요약 함수 호출 (함수가 없어도 죽지 않음)
+        # ---------------------------------------------------------
+        # C. AI 요약 생성 (가벼운 작업 먼저 실행)
+        # ---------------------------------------------------------
         try:
-            pdf_summary = summarization(text_content[:3000])  # 너무 길면 자름
-            pdf_understand = understand(text_content[:3000])
+            # 요약용 텍스트는 3000자로 자름
+            summary_input = text_content[:3000] if text_content else "내용 없음"
+            pdf_summary = summarization(summary_input)
+            pdf_understand = understand(summary_input)
         except Exception as e:
-            print(f"⚠️ 요약 생성 에러: {e}")
+            logger.error(f"⚠️ 요약 생성 에러: {e}")
             pdf_summary = "요약 생성 실패"
             pdf_understand = ["핵심 내용을 추출하지 못했습니다."]
 
         # ---------------------------------------------------------
-        # E. Supabase 업로드 및 DB 저장
+        # D. Supabase 원본 업로드 (안전하게 먼저 확보)
         # ---------------------------------------------------------
-        # 1. 원본 업로드
         with open(input_path, "rb") as f:
             path = f"originals/{input_filename}"
             supabase.storage.from_(STORAGE_BUCKET).upload(path, f, file_options={"content-type": "application/pdf"})
             original_url = supabase.storage.from_(STORAGE_BUCKET).get_public_url(path)
 
-        # 2. 번역본 업로드 (성공했다면)
-        translated_url = ""
-        if translate_success:
-            with open(final_output_path, "rb") as f:
-                path = f"translated/{final_output_filename}"
-                supabase.storage.from_(STORAGE_BUCKET).upload(path, f, file_options={"content-type": "application/pdf"})
-                translated_url = supabase.storage.from_(STORAGE_BUCKET).get_public_url(path)
+        # ---------------------------------------------------------
+        # E. 번역 실행 (가장 무거운 작업 - 실패 가능성 있음)
+        # ---------------------------------------------------------
+        translate_success = False
+        translated_url = None
+        
+        # 메모리 확보를 위해 강제 GC 실행
+        gc.collect() 
 
-        # 3. DB Insert
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if api_key:
+            try:
+                # 프롬프트 파일 생성
+                with open(prompt_path, "w", encoding="utf-8") as f:
+                    f.write("전문 용어 제외하고 한국어로 번역. 코드나 논문 제목은 원문 유지.")
+
+                env = os.environ.copy()
+                env['GEMINI_API_KEY'] = api_key
+                
+                # 타임아웃 120초로 증가 (무료 플랜 성능 고려)
+                # 주의: Render 무료 플랜은 subprocess 실행 시 메모리가 튀면 바로 Kill 당함
+                command = [
+                    "pdf2zh", input_path,
+                    "-li", "en", "-lo", "ko",
+                    "-s", "google:gemini",
+                    "-o", TEMP_DIR,
+                    "--prompt", prompt_path,
+                    "-t", "1" # 스레드 1개로 제한 (중요!)
+                ]
+                
+                logger.info("🤖 번역 프로세스 시작...")
+                subprocess.run(command, check=True, env=env, capture_output=True, timeout=120)
+
+                # 번역 결과물 찾기 로직
+                files_in_dir = os.listdir(TEMP_DIR)
+                target_prefix = input_filename.replace('.pdf', '')
+                
+                for fname in files_in_dir:
+                    if fname.endswith("-mono.pdf") and (target_prefix in fname):
+                        os.rename(os.path.join(TEMP_DIR, fname), final_output_path)
+                        files_to_clean.append(final_output_path)
+                        
+                        # 번역본 업로드
+                        with open(final_output_path, "rb") as f_trans:
+                            path_trans = f"translated/{final_output_filename}"
+                            supabase.storage.from_(STORAGE_BUCKET).upload(path_trans, f_trans, file_options={"content-type": "application/pdf"})
+                            translated_url = supabase.storage.from_(STORAGE_BUCKET).get_public_url(path_trans)
+                        
+                        translate_success = True
+                        logger.info("✅ 번역 및 업로드 성공")
+                        break
+                        
+            except subprocess.TimeoutExpired:
+                logger.error("⏰ 번역 시간 초과 (Timeout)")
+            except Exception as e:
+                logger.error(f"⚠️ 번역 프로세스 실패 (메모리 부족 등): {e}")
+        
+        # ---------------------------------------------------------
+        # F. DB 저장 (번역 실패했어도 원본 데이터는 저장)
+        # ---------------------------------------------------------
         db_data = {
             'user_id': user_id,
             'original_title': original_title,
             'translated_title': f"{original_title} (번역본)" if translate_success else original_title,
             'original_url': original_url,
-            'translated_url': translated_url,  # 없으면 빈 문자열 또는 null
-            'summarize': pdf_summary,  # 컬럼명 확인 필수 (summary vs summarize)
-            'understand': pdf_understand,  # 컬럼명 확인 필수 (key_points vs understand)
+            'translated_url': translated_url, # None이면 DB에 null로 들어감
+            'summarize': pdf_summary,
+            'understand': pdf_understand,
             'extracted_text': text_content[:5000]
         }
 
-        print(f"💾 DB 저장 시도...")
         response = supabase.table('Files').insert(db_data).execute()
-
-        # ID 추출
         new_file_id = response.data[0]['id']
 
+        # 성공 응답 반환
         return jsonify({
             "message": "처리 완료",
-            "file_id": new_file_id,  # 프론트엔드가 기다리는 핵심 데이터
-            'original_title': original_title,
-            'translated_title': f"{original_title} (번역본)" if translate_success else original_title,
-            'original_url': original_url,
-            'translated_url': translated_url,  # 없으면 빈 문자열 또는 null
-            'summarize': pdf_summary,  # 컬럼명 확인 필수 (summary vs summarize)
-            'understand': pdf_understand,  # 컬럼명
+            "file_id": new_file_id,
+            "translate_status": "success" if translate_success else "failed"
         })
 
     except Exception as e:
-        print(f"\n❌ [치명적 서버 에러]: {e}")
+        logger.error(f"❌ [치명적 서버 에러]: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
     finally:
-        # 임시 파일 정리
+        # 파일 정리 및 메모리 해제
         for f in files_to_clean:
             if os.path.exists(f):
                 try:
                     os.remove(f)
                 except:
                     pass
+        gc.collect() # 마지막으로 메모리 비우기
 
 @app.route('/api/chat', methods=['POST'])
 def chat():
