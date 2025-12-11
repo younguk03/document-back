@@ -9,7 +9,7 @@ import subprocess
 import fitz  # PyMuPDF (코드 최상단에 추가 권장)
 from werkzeug.utils import secure_filename
 import gc
-
+import logging
 from summarize import summarization, understand
 import google.generativeai as genai
 
